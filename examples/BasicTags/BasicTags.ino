@@ -13,7 +13,6 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   // F() keeps metadata in flash on the Uno. Plain "text" is also supported.
   LightYak.Listen(Serial, 115200, SERIAL_8N1, F("Pump Controller"));
-  //LightYak.SetCatalogRevision(2);
   LightYak.AddTag(motorEnabled, F("Motor Enabled"), lightyak::ReadWrite);
   LightYak.AddTag(operatingMode, F("Operating Mode"), lightyak::ReadWrite);
   LightYak.AddTag(targetRPM, F("Target RPM"), lightyak::ReadWrite);

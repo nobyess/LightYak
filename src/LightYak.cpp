@@ -13,6 +13,10 @@
 lightyak::Device LightYak;
 
 namespace lightyak {
+#if defined(ARDUINO_ARCH_ESP32)
+bool IRAM_ATTR Device::TryLockTags() { return portTRY_ENTER_CRITICAL_SAFE(&tagMux_, 0); }
+void IRAM_ATTR Device::UnlockTags() { portEXIT_CRITICAL_SAFE(&tagMux_); }
+#endif
 namespace {
 #ifdef __AVR__
 const uint16_t crcTable[16] PROGMEM = {
@@ -191,9 +195,15 @@ Status Device::readValue(uint16_t ref, uint8_t prop, uint8_t& type, uint8_t* out
   }
   if (ref>tagCount_ || prop!=Value) return UnknownTarget;
   const Tag& tag=tags_[ref-1];type=tag.type;length=width(type);
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!TryLockTags()) return Deferred;
+#endif
   LY_ATOMIC {
     for(uint8_t i=0;i<length;++i) out[littleEndian()?i:length-1-i]=tag.value[i];
   }
+#if defined(ARDUINO_ARCH_ESP32)
+  UnlockTags();
+#endif
   ++work_.tagCopies;return Ok;
 }
 Status Device::writeValue(uint16_t ref, uint8_t prop, uint8_t type, const uint8_t* data, uint8_t length) {
@@ -203,9 +213,15 @@ Status Device::writeValue(uint16_t ref, uint8_t prop, uint8_t type, const uint8_
   if(tag.access!=ReadWrite) return NotWritable;
   if(type!=tag.type || !width(type) || length!=width(type)) return TypeMismatch;
   if(type==Bool && data[0]>1) return BadValue;
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!TryLockTags()) return Deferred;
+#endif
   LY_ATOMIC {
     for(uint8_t i=0;i<length;++i) tag.value[i]=data[littleEndian()?i:length-1-i];
   }
+#if defined(ARDUINO_ARCH_ESP32)
+  UnlockTags();
+#endif
   ++work_.tagCopies;return Ok;
 }
 
@@ -259,6 +275,9 @@ void Device::advance(uint32_t now) {
       uint16_t ref=get16(p+commandPosition_);uint8_t prop=p[commandPosition_+2];
       uint8_t type=0,n=0,value[4]={0,0,0,0};
       Status status=readValue(ref,prop,type,value,n,now);
+#if defined(ARDUINO_ARCH_ESP32)
+      if (status==Deferred) break;
+#endif
       put16(tx_+txLength_,ref);txLength_+=2;tx_[txLength_++]=prop;
       tx_[txLength_++]=status;tx_[txLength_++]=type;tx_[txLength_++]=n;
       for(uint8_t i=0;i<n;++i) tx_[txLength_++]=value[i];
@@ -270,6 +289,9 @@ void Device::advance(uint32_t now) {
       const uint8_t* item=p+commandPosition_;
       uint16_t ref=get16(item);uint8_t prop=item[2],n=item[4];
       Status status=writeValue(ref,prop,item[3],item+5,n);
+#if defined(ARDUINO_ARCH_ESP32)
+      if (status==Deferred) break;
+#endif
       put16(tx_+txLength_,ref);txLength_+=2;tx_[txLength_++]=prop;tx_[txLength_++]=status;
       commandPosition_=static_cast<uint8_t>(commandPosition_+5+n);
       if(++itemIndex_==itemCount_) sealResponse();

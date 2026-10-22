@@ -72,7 +72,7 @@ application_tag_count:u16
 catalog_revision:u32
 max_payload:u8             = 64
 max_batch:u8               = 6
-registry_capacity:u8       = build setting (default 24)
+registry_capacity:u8       = build setting (default 10)
 device_name_byte_length:u8 = 0..24
 device_name:bytes
 ```
@@ -144,7 +144,7 @@ Count is 1..6. The frame CRC, full payload structure, every item boundary, and a
 
 Once structure is validated, permissions, target, type, width, and boolean encoding are checked per item. Semantic failures do not roll back earlier successes and do not prevent later items. At most one item is applied per `Update()`. Duplicate targets apply in request order.
 
-Response payload: `count:u8`, then `reference:u16 + property:u8 + status:u8` per item. An OK is generated after the write is applied; the response may be transmitted later. Actual variable updates are bounded scalar copies, with interrupt-state-preserving protection on AVR. It is possible for an ISR/application to change a value again before acknowledgment reaches the HMI.
+Response payload: `count:u8`, then `reference:u16 + property:u8 + status:u8` per item. An OK is generated after the write is applied; the response may be transmitted later. Actual variable updates are bounded scalar copies, with interrupt-state-preserving protection on AVR and a zero-wait try-critical-section on ESP32. Contention on ESP32 defers that item to a later call without advancing the request or adding any wire status. It is possible for a cooperating ISR/application to change a value again before acknowledgment reaches the HMI. Frames, operations, type codes, limits and error codes are identical on both platforms.
 
 ### FF ERROR
 

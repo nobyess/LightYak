@@ -5,25 +5,17 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <float.h>
+#include "LightYakConfig.h"
 #ifdef ARDUINO
 #include <Arduino.h>
 #endif
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+#include "LightYakEsp32.h"
+#endif
 #ifdef __AVR__
 #include <avr/pgmspace.h>
-#endif
-
-// Override consistently for ALL translation units (compiler -D flags).
-#ifndef LIGHTYAK_MAX_TAGS
-#define LIGHTYAK_MAX_TAGS 24
-#endif
-#ifndef LIGHTYAK_RX_BUDGET
-#define LIGHTYAK_RX_BUDGET 4
-#endif
-#ifndef LIGHTYAK_TX_BUDGET
-#define LIGHTYAK_TX_BUDGET 4
-#endif
-#ifndef LIGHTYAK_PREP_BUDGET
-#define LIGHTYAK_PREP_BUDGET 4
 #endif
 
 namespace lightyak {
@@ -97,14 +89,31 @@ public:
   bool Listen(const Transport& transport, const char* deviceName);
   bool Listen(const Transport& transport, Text deviceName);
 #ifdef ARDUINO
-  template<typename Port> bool Listen(Port& port, unsigned long baud, uint8_t config, const char* name) {
+#if defined(ARDUINO_ARCH_ESP32)
+  bool Listen(Esp32Uart& port, unsigned long baud, uint32_t config, const char* name) {
+    return listenEsp32(port, baud, config, Text(name));
+  }
+  bool Listen(Esp32Uart& port, unsigned long baud, uint32_t config, const __FlashStringHelper* name) {
+    return listenEsp32(port, baud, config, Text(reinterpret_cast<const char*>(name), true));
+  }
+  template<typename Port> bool Listen(Port&, unsigned long, uint32_t, const char*) {
+    static_assert(sizeof(Port) == 0, "Use lightyak::Esp32Uart on ESP32; HardwareSerial and USB CDC are not bounded LightYak adapters");
+    return false;
+  }
+  template<typename Port> bool Listen(Port&, unsigned long, uint32_t, const __FlashStringHelper*) {
+    static_assert(sizeof(Port) == 0, "Use lightyak::Esp32Uart on ESP32; HardwareSerial and USB CDC are not bounded LightYak adapters");
+    return false;
+  }
+#else
+  template<typename Port> bool Listen(Port& port, unsigned long baud, uint32_t config, const char* name) {
     port.begin(baud, config);
     return listenPort(port, Text(name));
   }
-  template<typename Port> bool Listen(Port& port, unsigned long baud, uint8_t config, const __FlashStringHelper* name) {
+  template<typename Port> bool Listen(Port& port, unsigned long baud, uint32_t config, const __FlashStringHelper* name) {
     port.begin(baud, config);
     return listenPort(port, Text(reinterpret_cast<const char*>(name), true));
   }
+#endif
 #endif
   template<typename T> uint16_t AddTag(T& variable, const char* name, Access access = ReadOnly) {
     return addScalar(variable, Text(name), access);
@@ -120,6 +129,12 @@ public:
   InitError LastError() const { return init_; }
   uint16_t TagCount() const { return tagCount_; }
   const WorkReport& LastWork() const { return work_; }
+#if defined(ARDUINO_ARCH_ESP32)
+  // Other tasks/ISRs touching registered values must use this same guard.
+  // Both acquisition and Update() defer on contention rather than spin/wait.
+  bool IRAM_ATTR TryLockTags();
+  void IRAM_ATTR UnlockTags();
+#endif
 
 private:
   static const uint8_t HeaderSize = 5;
@@ -132,6 +147,12 @@ private:
     return registerTag(reinterpret_cast<volatile uint8_t*>(&variable), Scalar<Base>::type, name, access);
   }
 #ifdef ARDUINO
+#if defined(ARDUINO_ARCH_ESP32)
+  bool listenEsp32(Esp32Uart& port, unsigned long baud, uint32_t config, Text name) {
+    if (!port.Begin(baud, config)) return Listen(Transport{0,0,0,0}, name);
+    return Listen(port.Adapter(), name);
+  }
+#else
   template<typename Port> struct SerialAdapter {
     static int read(void* p) { return static_cast<Port*>(p)->read(); }
     static bool write(void* p, uint8_t b) {
@@ -145,6 +166,7 @@ private:
     Transport t = { &port, SerialAdapter<Port>::read, SerialAdapter<Port>::write, SerialAdapter<Port>::clock };
     return Listen(t, name);
   }
+#endif
 #endif
   uint16_t registerTag(volatile uint8_t*, uint8_t, Text, Access);
   static uint8_t textByte(Text, uint8_t);
@@ -202,11 +224,11 @@ private:
   uint8_t copyPosition_;
   uint8_t deviceNameLength_;
   WorkReport work_;
+#if defined(ARDUINO_ARCH_ESP32)
+  static const Status Deferred = static_cast<Status>(254); // internal, never sent
+  portMUX_TYPE tagMux_ = portMUX_INITIALIZER_UNLOCKED;
+#endif
 };
-static_assert(LIGHTYAK_MAX_TAGS > 0 && LIGHTYAK_MAX_TAGS <= 255, "tag capacity must be 1..255");
-static_assert(LIGHTYAK_RX_BUDGET > 0 && LIGHTYAK_RX_BUDGET <= 32, "RX budget must be 1..32");
-static_assert(LIGHTYAK_TX_BUDGET > 0 && LIGHTYAK_TX_BUDGET <= 32, "TX budget must be 1..32");
-static_assert(LIGHTYAK_PREP_BUDGET > 0 && LIGHTYAK_PREP_BUDGET <= 16, "prepare budget must be 1..16");
 } // namespace lightyak
 
 extern lightyak::Device LightYak;

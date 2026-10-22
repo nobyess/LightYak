@@ -65,7 +65,7 @@ int main(){
   test("CRC golden vector",[]{CHECK(crc(Bytes{'1','2','3','4','5','6','7','8','9'})==0x29b1);});
   test("unconfigured Update is harmless",[]{Device d;d.Update();CHECK(!d.Ready());CHECK(d.LastError()==NoTransport);});
   test("idle path skips clock and tag work",[]{Rig r;r.tick();CHECK(r.link.clocks==0);CHECK(r.d.LastWork().actions==0);CHECK(r.d.LastWork().received==0);});
-  test("identify fields and metadata",[]{Rig r;r.d.SetCatalogRevision(0x12345678);auto p=r.request(Identify);CHECK(p.op==0x81);CHECK(p.payload[0]==InitOk);CHECK(r16(p.payload,1)==4);CHECK(p.payload[3]==0x78);CHECK(p.payload[7]==MaxPayload);CHECK(p.payload[8]==MaxBatch);CHECK(std::string(p.payload.begin()+11,p.payload.end())=="Pump Controller");});
+  test("identify fields and metadata",[]{Rig r;r.d.SetCatalogRevision(0x12345678);auto p=r.request(Identify);CHECK(p.op==0x81);CHECK(p.payload[0]==InitOk);CHECK(r16(p.payload,1)==4);CHECK(p.payload[3]==0x78);CHECK(p.payload[7]==MaxPayload);CHECK(p.payload[8]==MaxBatch);CHECK(p.payload[9]==LIGHTYAK_MAX_TAGS);CHECK(std::string(p.payload.begin()+11,p.payload.end())=="Pump Controller");});
   test("browse every system and application entry",[]{Rig r;uint16_t cursor=0;size_t seen=0;do{Bytes q;u16(q,cursor);auto p=r.request(Browse,q);CHECK(p.op==0x82);CHECK(p.payload.size()==size_t(8+p.payload[7]));CHECK(p.payload[7]>0);if(seen<SystemProperties){CHECK(r16(p.payload,2)==0);CHECK(p.payload[4]==seen+1);CHECK(p.payload[6]==ReadOnly);}else{CHECK(r16(p.payload,2)==seen-SystemProperties+1);CHECK(p.payload[4]==Value);}cursor=r16(p.payload,0);++seen;}while(cursor!=EndCursor);CHECK(seen==10);});
   test("browse invalid cursor",[]{Rig r;error(r.request(Browse,{0xff,0xff}),BadCursor);});
   test("read mixed types and little endian",[]{Rig r;auto v=readResults(r.request(Read,readTargets({target(1),target(2),target(3),target(4)})));CHECK(v.size()==4);CHECK(v[0].type==Bool&&v[0].value==Bytes{0});CHECK(v[1].type==Int16&&v[1].value==Bytes({0xb0,0x04}));CHECK(v[2].value==Bytes({0x78,0x56,0x34,0x12}));CHECK(v[3].type==Float32&&v[3].value==Bytes({0,0,0xb4,0x41}));});
@@ -112,6 +112,48 @@ int main(){
   test("float special bit patterns are preserved",[]{Rig r;for(Bytes b: {Bytes{0,0,0,128},Bytes{0,0,128,127},Bytes{0,0,192,127}}){CHECK(writeStatus(r.request(Write,writeItems({item(4,Float32,b)})))==Ok);CHECK(readResults(r.request(Read,readTargets({target(4)})))[0].value==b);}});
   test("deterministic malformed-input fuzz and recovery",[]{Rig r;std::mt19937 rng(0x1a17);for(int round=0;round<1000;++round){Bytes noise;int n=int(rng()%128);for(int i=0;i<n;++i)noise.push_back(uint8_t(rng()));noise.push_back(0x7e);r.link.feed(noise);r.pump(noise.size()+200);CHECK(!r.enabled&&r.rpm==1200);r.link.output.clear();CHECK(r.request(Identify,{},uint8_t(round)).op==0x81);}});
   test("valid random typed writes and readbacks",[]{Rig r;std::mt19937 rng(42);for(int i=0;i<500;++i){uint32_t bits=rng();Bytes b{uint8_t(bits),uint8_t(bits>>8),uint8_t(bits>>16),uint8_t(bits>>24)};CHECK(writeStatus(r.request(Write,writeItems({item(4,Float32,b)})))==Ok);CHECK(readResults(r.request(Read,readTargets({target(4)})))[0].value==b);}});
+  test("full registry browses every configured slot",[]{
+    Rig r;
+    uint32_t values[LIGHTYAK_MAX_TAGS] = {};
+    for(uint16_t i=4;i<LIGHTYAK_MAX_TAGS;++i) {
+      values[i]=1000+i;
+      CHECK(r.d.AddTag(values[i],"Extra",ReadWrite)==i+1);
+    }
+    CHECK(r.d.TagCount()==LIGHTYAK_MAX_TAGS);
+    auto identity=r.request(Identify);
+    CHECK(r16(identity.payload,1)==LIGHTYAK_MAX_TAGS);
+    uint16_t cursor=0,seen=0;
+    do {
+      Bytes q;u16(q,cursor);
+      auto page=r.request(Browse,q);
+      CHECK(page.op==(Browse|ResponseBit));
+      if(seen>=SystemProperties) CHECK(r16(page.payload,2)==seen-SystemProperties+1);
+      cursor=r16(page.payload,0);++seen;
+    } while(cursor!=EndCursor);
+    CHECK(seen==SystemProperties+LIGHTYAK_MAX_TAGS);
+  });
+  test("last reserved slot reads and writes without extra scalar work",[]{
+    Rig r;
+    uint32_t values[LIGHTYAK_MAX_TAGS] = {};
+    for(uint16_t i=4;i<LIGHTYAK_MAX_TAGS;++i) CHECK(r.d.AddTag(values[i],"Value",ReadWrite)==i+1);
+    auto p=r.request(Write,writeItems({item(LIGHTYAK_MAX_TAGS,UInt32,{0x78,0x56,0x34,0x12})}));
+    CHECK(writeStatus(p)==Ok);
+    CHECK(values[LIGHTYAK_MAX_TAGS-1]==0x12345678);
+    r.link.output.clear();
+    r.link.feed(frame(Read,17,readTargets({target(LIGHTYAK_MAX_TAGS)})));
+    unsigned copies=0;
+    for(int i=0;i<500;++i) {r.tick();copies+=r.d.LastWork().tagCopies;}
+    auto packets=decode(r.link.output);CHECK(packets.size()==1);
+    CHECK(readResults(packets[0])[0].value==Bytes({0x78,0x56,0x34,0x12}));
+    CHECK(copies==1);
+  });
+  test("idle work is unchanged when the registry is full",[]{
+    Rig r;uint8_t value=0;
+    for(uint16_t i=4;i<LIGHTYAK_MAX_TAGS;++i) CHECK(r.d.AddTag(value,"Value")==i+1);
+    r.tick();
+    CHECK(r.link.reads==1 && r.link.clocks==0 && r.link.writes==0);
+    CHECK(r.d.LastWork().actions==0 && r.d.LastWork().tagCopies==0);
+  });
   test("Update never allocated heap memory",[]{CHECK(updateAllocations==0);});
   std::cout<<passed<<" passed, "<<failed<<" failed; sizeof(Device)="<<sizeof(Device)<<" native bytes\n";
   return failed?1:0;

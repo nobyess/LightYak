@@ -2,6 +2,7 @@
 """Reproducible native and cross-language suite. No Arduino hardware required."""
 import argparse
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -39,9 +40,62 @@ def main():
                           f"-DLIGHTYAK_PREP_BUDGET={budget}", ROOT / "src/LightYak.cpp",
                           ROOT / "tests/test_lightyak.cpp", "-o", executable])
             run([executable])
+        # Compare against the original capacity with identical default work budgets.
+        baseline = build / ("test_capacity_24" + suffix)
+        run(common + ["-DLIGHTYAK_MAX_TAGS=24", ROOT / "src/LightYak.cpp",
+                      ROOT / "tests/test_lightyak.cpp", "-o", baseline])
+        run([baseline])
+        # Exercise the normal user workflow: edit ONLY the shared header, then
+        # compile sketch/client and implementation as distinct translation units.
+        copied_src = build / "shared-config-src"
+        copied_src.mkdir(exist_ok=True)
+        for name in ("LightYak.h", "LightYak.cpp", "LightYakConfig.h"):
+            shutil.copyfile(ROOT / "src" / name, copied_src / name)
+        config = copied_src / "LightYakConfig.h"
+        text = config.read_text()
+        text, replacements = re.subn(r"(#define LIGHTYAK_MAX_TAGS )\d+", r"\g<1>64", text)
+        if replacements != 1:
+            raise RuntimeError("Expected exactly one shared tag-capacity default")
+        config.write_text(text)
+        configured_common = [copied_src if arg == ROOT / "src" else arg for arg in common]
+        configured = build / ("test_shared_config_64" + suffix)
+        run(configured_common + [copied_src / "LightYak.cpp", ROOT / "tests/test_lightyak.cpp",
+                                 "-o", configured])
+        run([configured])
         simulator = build / ("simulator" + suffix)
         run(common + [ROOT / "src/LightYak.cpp", ROOT / "tests/simulator.cpp", "-o", simulator])
         run([sys.executable, ROOT / "tests/test_client.py", simulator])
+        # Compile and exercise the real ESP32 code paths against small IDF/HAL
+        # fakes. Blocking TX APIs are deliberately absent from their headers.
+        esp_common = common + ["-DARDUINO=10819", "-DARDUINO_ARCH_ESP32",
+                               "-I", ROOT / "tests/esp32_stubs"]
+        esp_sources = [ROOT / "src/LightYak.cpp", ROOT / "src/LightYakEsp32.cpp",
+                       ROOT / "tests/esp32_stubs/Esp32Mock.cpp"]
+        for budget in (4, 1, 8):
+            flags = [f"-DLIGHTYAK_RX_BUDGET={budget}", f"-DLIGHTYAK_TX_BUDGET={budget}",
+                     f"-DLIGHTYAK_PREP_BUDGET={budget}"]
+            executable = build / (f"test_esp32_core_{budget}" + suffix)
+            run(esp_common + flags + esp_sources + [ROOT / "tests/test_lightyak.cpp", "-o", executable])
+            run([executable])
+        esp_adapter = build / ("test_esp32_adapter" + suffix)
+        run(esp_common + esp_sources + [ROOT / "tests/test_esp32.cpp", "-o", esp_adapter])
+        run([esp_adapter])
+        esp_simulator = build / ("simulator_esp32" + suffix)
+        run(esp_common + esp_sources + [ROOT / "tests/simulator_esp32.cpp", "-o", esp_simulator])
+        run([sys.executable, ROOT / "tests/test_client.py", esp_simulator])
+        # Prevent accidentally using HardwareSerial/USB streams with waiting HAL
+        # locks, and prevent silently registering native 64-bit double values.
+        for name, body, diagnostic in [
+            ("esp32_hardware_serial", 'd.Listen(Serial, 115200, SERIAL_8N1, "Bad");', "Use lightyak::Esp32Uart"),
+            ("esp32_native_double", 'double value=1.0; d.AddTag(value, "Bad");', "LightYak supports mutable"),
+        ]:
+            source = build / (name + ".cpp")
+            source.write_text('#include "LightYak.h"\nvoid test() { lightyak::Device d; ' + body + ' }\n')
+            result = subprocess.run(list(map(str, esp_common + ["-fsyntax-only", source])),
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 or diagnostic not in result.stderr:
+                raise RuntimeError("Expected ESP32 rejection: " + name + "\n" + result.stderr)
+            print("PASS ESP32 compile-time rejection:", name, flush=True)
         for name, declaration, expression in [
             ("character_buffer", 'char value[8] = "hello";', "value"),
             ("const_scalar", "const int value = 1;", "value"),
@@ -56,7 +110,21 @@ def main():
             if result.returncode == 0 or "LightYak supports mutable" not in result.stderr:
                 raise RuntimeError("Expected clear compile-time rejection: " + name + "\n" + result.stderr)
             print("PASS compile-time rejection:", name, flush=True)
-        print("All suites passed: 3 work-budget configurations, client interoperability, and unsupported-type checks.")
+        for flag, diagnostic in [
+            ("LIGHTYAK_MAX_TAGS=0", "tag capacity must be 1..255"),
+            ("LIGHTYAK_MAX_TAGS=256", "tag capacity must be 1..255"),
+            ("LIGHTYAK_RX_BUDGET=0", "RX budget must be 1..32"),
+            ("LIGHTYAK_TX_BUDGET=33", "TX budget must be 1..32"),
+            ("LIGHTYAK_PREP_BUDGET=17", "prepare budget must be 1..16"),
+        ]:
+            source = build / "invalid_config.cpp"
+            source.write_text('#include "LightYak.h"\n')
+            result = subprocess.run(list(map(str, common + ["-D" + flag, "-fsyntax-only", source])),
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 or diagnostic not in result.stderr:
+                raise RuntimeError("Expected configuration rejection: " + flag + "\n" + result.stderr)
+            print("PASS invalid configuration:", flag, flush=True)
+        print("All suites passed: native/ESP32 work budgets, shared configuration, both client simulators, ESP32 UART adapter, and compile-time checks.")
     finally:
         if temp:
             temp.cleanup()
